@@ -31,7 +31,7 @@ export class VpcPluralsightStack extends Stack {
         publicRouteTable.applyRemovalPolicy(RemovalPolicy.DESTROY);
 
         const publicSubnetRouteTableAssociation =
-            new ec2.CfnSubnetRouteTableAssociation(this, "PublicRouteTableSubnetAssociation", {
+            new ec2.CfnSubnetRouteTableAssociation(this, "PublicRouteTableSubnetAssociation1", {
                 subnetId: publicSubnet.subnetId,
                 routeTableId: publicRouteTable.attrRouteTableId
             });
@@ -54,5 +54,61 @@ export class VpcPluralsightStack extends Stack {
             gatewayId: publicInternetGateway.attrInternetGatewayId
         });
         route.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /* Create a new security group attached to the public facing VPC.
+        * Allow SSH access into this VPC using a specific IP range 24.96.0.0/16
+        * Allow any ipv4 or ipv6 address to connect to this VPC */
+        const publicSecurityGroup = new ec2.SecurityGroup(this, "PublicSecurityGroup", {
+            vpc: publicVpc,
+            securityGroupName: "web-pub-sg",
+            description: "Public VPC security group",
+            // Allow the VPC to make connections to the outside world.
+            // True by default but making explicit here
+            allowAllOutbound: true
+        });
+        publicSecurityGroup.applyRemovalPolicy(RemovalPolicy.DESTROY);
+        publicSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("24.96.0.0/16"),
+            ec2.Port.tcp(22),
+            "SSH access from IP range 24.96.0.0/16"
+        );
+        publicSecurityGroup.addIngressRule(
+            ec2.Peer.anyIpv4(),
+            ec2.Port.tcp(80),
+            "Allow access into this public VPC from any ipv4 address"
+        );
+        publicSecurityGroup.addIngressRule(
+            ec2.Peer.anyIpv6(),
+            ec2.Port.tcp(80),
+            "Allow access into this public VPC from any ipv6 address"
+        );
+
+        /* Create a keypair to allow SSH access to a running EC2 instance */
+        const sshKeyPair = new ec2.CfnKeyPair(this, "ssh-keypair", {
+            keyName: "public-ssh-key-pair"
+        });
+        sshKeyPair.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const publicEc2Instance = new ec2.Instance(this, "public-ec2-instance", {
+            vpc: publicVpc,
+            keyName: sshKeyPair.keyName,
+            vpcSubnets: {subnets: [publicSubnet]},
+            privateIpAddress: "10.1.254.10",
+            instanceType: new ec2.InstanceType("t2.micro"),
+            machineImage: ec2.MachineImage.latestAmazonLinux(),
+            instanceName: "public-ec2-instance",
+            securityGroup: publicSecurityGroup
+        });
+        publicEc2Instance.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /* Creates a new elastic IP and associates it to the EC2 instance tied to the public VPC.
+        * This gives the instance a static ipv4 address which can be hit by outside traffic */
+        const publicIpv4Address = new ec2.CfnEIP(this, "public-elastic-ip");
+        publicIpv4Address.applyRemovalPolicy(RemovalPolicy.DESTROY);
+        const publicElasticIpVpcAssociation = new ec2.CfnEIPAssociation(this, "public-elastic-ip-network-interface-assc", {
+            instanceId: publicEc2Instance.instanceId,
+            allocationId: publicIpv4Address.attrAllocationId
+        });
+        publicElasticIpVpcAssociation.applyRemovalPolicy(RemovalPolicy.DESTROY);
     }
 }
