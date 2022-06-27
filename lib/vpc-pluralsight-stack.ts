@@ -110,5 +110,84 @@ export class VpcPluralsightStack extends Stack {
             allocationId: publicIpv4Address.attrAllocationId
         });
         publicElasticIpVpcAssociation.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /* Create a VPC to act as shared private part of infra */
+        const sharedVpc = new ec2.Vpc(this, "SharedVpc", {
+            vpcName: "shared-vpc",
+            cidr: "10.2.0.0/16",
+            // If left undefined CDK tries to create default subnets which causes conflict and errors
+            // Empty array prevents this
+            subnetConfiguration: []
+        });
+        sharedVpc.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /* Create a subnet which holds the private database */
+        const databaseSubnet = new ec2.Subnet(this, "DatabaseSubnet", {
+            vpcId: sharedVpc.vpcId,
+            availabilityZone: "eu-west-1a", // Keep zone same as public VPC. Different zones will still work but AWS will charge more
+            cidrBlock: "10.2.2.0/24"
+        });
+        databaseSubnet.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /* Create a route table tied to the shared VPC */
+        const sharedVpcRouteTable = new ec2.CfnRouteTable(this, "SharedRouteTable", {
+            vpcId: sharedVpc.vpcId
+        });
+        sharedVpcRouteTable.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const sharedSubnetRouteTableAssociation =
+            new ec2.CfnSubnetRouteTableAssociation(this, "SharedRouteTableSubnetAssociation", {
+                subnetId: databaseSubnet.subnetId,
+                routeTableId: sharedVpcRouteTable.attrRouteTableId
+            });
+        sharedSubnetRouteTableAssociation.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /* Create a new security group attached to the database instance .
+        * Allow SSH access into this VPC using a specific IP ranges 192.168.0.0/16 or 10.2.0.0/16
+        * Allow public subnet MySQL access only.
+        * Allow any ipv4 to ping instance */
+        const databaseSecurityGroup = new ec2.SecurityGroup(this, "DatabaseSecurityGroup", {
+            vpc: sharedVpc,
+            securityGroupName: "database-sg",
+            description: "Database security group",
+            // Allow the VPC to make connections to the outside world.
+            // True by default but making explicit here
+            allowAllOutbound: true
+        });
+        databaseSecurityGroup.applyRemovalPolicy(RemovalPolicy.DESTROY);
+        databaseSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("192.168.0.0/16"),
+            ec2.Port.tcp(22),
+            "SSH access from IP range 192.168.0.0/16"
+        );
+        databaseSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("10.2.0.0/16"),
+            ec2.Port.tcp(22),
+            "SSH access from IP range 10.2.0.0/16"
+        );
+        databaseSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("10.1.254.0/24"),
+            ec2.Port.tcp(3306),
+            "MySQL access from public subnet into database instance"
+        );
+        databaseSecurityGroup.addIngressRule(
+            ec2.Peer.anyIpv4(),
+            ec2.Port.icmpPing(),
+            "Allow ICMP ping from any ipv4"
+        );
+
+        /* Instance representing database running in AWS. Using private VPC and database subnet
+        * No EiP defined as we don't want to allow public access to this instance */
+        const databaseEc2Instance = new ec2.Instance(this, "database-ec2-instance", {
+            vpc: sharedVpc,
+            keyName: sshKeyPair.keyName,
+            vpcSubnets: {subnets: [databaseSubnet]},
+            privateIpAddress: "10.2.2.41",
+            instanceType: new ec2.InstanceType("t2.micro"),
+            machineImage: ec2.MachineImage.latestAmazonLinux(),
+            instanceName: "database-ec2-instance",
+            securityGroup: databaseSecurityGroup
+        });
+        databaseEc2Instance.applyRemovalPolicy(RemovalPolicy.DESTROY);
     }
 }
