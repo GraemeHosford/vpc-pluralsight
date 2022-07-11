@@ -1,6 +1,7 @@
 import {RemovalPolicy, Stack, StackProps} from 'aws-cdk-lib';
 import {Construct} from 'constructs';
 import * as ec2 from "aws-cdk-lib/aws-ec2";
+import {CfnVPCPeeringConnection} from "aws-cdk-lib/aws-ec2";
 
 export class VpcPluralsightStack extends Stack {
     constructor(scope: Construct, id: string, props?: StackProps) {
@@ -189,5 +190,139 @@ export class VpcPluralsightStack extends Stack {
             securityGroup: databaseSecurityGroup
         });
         databaseEc2Instance.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        /*
+        * Some limitations of VPC peering:
+        * * VPCs can be peered across regions but ipv6 cross-region is not supported
+        * * Peered VPCs cannot have overlapping CIDR blocks
+        * * An instance in one VPC cannot use the IGW in a peered VPC to reach the internet
+        * (less a limitation more an expected security measure,
+        * same applies to other resources, MAT gateways, other peering connections, etc)
+        *
+        * Useful doc on invalid VPC connections
+        * https://docs.aws.amazon.com/vpc/latest/peering/invalid-peering-configurations.html
+        * */
+
+        // Create peering connection between the two VPCs
+        const vpcPeeringConnection = new CfnVPCPeeringConnection(this, "PCX", {
+                vpcId: publicVpc.vpcId,
+                peerVpcId: sharedVpc.vpcId,
+                tags: [{key: "Name", value: "web-shared-pcx"}]
+            }
+        );
+        vpcPeeringConnection.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const publicRouteTablePeeringRoute = new ec2.CfnRoute(this, "public-route-table-peering-route", {
+            routeTableId: publicRouteTable.attrRouteTableId,
+            destinationCidrBlock: "10.2.2.0/24",
+            vpcPeeringConnectionId: vpcPeeringConnection.peerOwnerId
+        });
+        publicRouteTablePeeringRoute.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const sharedRouteTablePeeringRoute = new ec2.CfnRoute(this, "shared-route-table-peering-route", {
+            routeTableId: sharedVpcRouteTable.attrRouteTableId,
+            destinationCidrBlock: "10.1.254.0/24",
+            vpcPeeringConnectionId: vpcPeeringConnection.peerOwnerId
+        });
+        sharedRouteTablePeeringRoute.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const sharedInternetGateway = new ec2.CfnInternetGateway(this, "shared-igw", {
+            tags: [{ key: "Name", value: "shared-igw" }]
+        });
+        sharedInternetGateway.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const sharedVpcIgwAttachment = new ec2.CfnVPCGatewayAttachment(this, "SharedVpcIgwAttachment", {
+            vpcId: sharedVpc.vpcId,
+            internetGatewayId: sharedInternetGateway.attrInternetGatewayId
+        });
+        sharedVpcIgwAttachment.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const natSubnet = new ec2.Subnet(this, "shared-nat-subnet", {
+            vpcId: sharedVpc.vpcId,
+            availabilityZone: "eu-west-1a",
+            cidrBlock: "10.2.254.0/24"
+        });
+        natSubnet.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const natRouteTable = new ec2.CfnRouteTable(this, "nat-pub-route-table", {
+            vpcId: sharedVpc.vpcId,
+            tags: [{ key: "Name", value: "nat-pub" }]
+        });
+        natRouteTable.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        // TODO: Check if even needed after deploying
+        // const sharedRouteTableRoute = new ec2.CfnRoute(this, "shared-route-table-route", {
+        //     routeTableId: natRouteTable.attrRouteTableId,
+        //     destinationCidrBlock: "10.2.0.0/16"
+        // });
+        // sharedRouteTableRoute.applyRemovalPolicy(RemovalPolicy.DESTROY);
+        const defaultNatRoute = new ec2.CfnRoute(this, "default-nat-route", {
+            routeTableId: natRouteTable.attrRouteTableId,
+            destinationCidrBlock: "0.0.0.0/0",
+            gatewayId: sharedInternetGateway.attrInternetGatewayId
+        });
+        defaultNatRoute.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const natSubnetRouteTableAssociation =
+            new ec2.CfnSubnetRouteTableAssociation(this, "NATRouteTableSubnetAssociation", {
+                subnetId: natSubnet.subnetId,
+                routeTableId: natRouteTable.attrRouteTableId
+            });
+        natSubnetRouteTableAssociation.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const natSecurityGroup = new ec2.SecurityGroup(this, "nat-security-group", {
+            vpc: sharedVpc,
+            securityGroupName: "NAT instance",
+            description: "Security group for NAT instance"
+        });
+        natSecurityGroup.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        natSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("24.96.0.0/16"),
+            ec2.Port.tcp(22),
+            "Allow SSH access from ip range 24.96.0.0/16"
+        );
+        natSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("10.0.0.0/8"),
+            ec2.Port.allTraffic(),
+            "Allow 10.0.0.0/8 to access all traffic"
+        );
+        natSecurityGroup.addIngressRule(
+            ec2.Peer.ipv4("192.168.0.0/16"),
+            ec2.Port.allTraffic(),
+            "Allow 192.168.0.0/16 to access all traffic"
+        );
+
+        /*
+        * In reality this NAT instance would instead be a NAT gateway
+        * NAT gateways can handle far more traffic than a NAT instance and are highly available.
+        * Neither is true of a NAT instance using size t2.micro
+        *
+        * Using an instance here to follow along with Pluralsight course
+        * */
+        // TODO: Check if have to stop source/destination check when deployed
+        const natEc2Instance = new ec2.Instance(this, "nat-ec2-instance", {
+            vpc: sharedVpc,
+            keyName: sshKeyPair.keyName,
+            vpcSubnets: {subnets: [natSubnet]},
+            privateIpAddress: "10.2.254.254",
+            instanceType: new ec2.InstanceType("t2.micro"),
+            machineImage: new ec2.NatInstanceImage(),
+            instanceName: "nat-ec2-instance",
+            securityGroup: natSecurityGroup
+        });
+        natEc2Instance.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const natEip = new ec2.CfnEIP(this, "nat-eip", {
+            instanceId: natEc2Instance.instanceId
+        });
+        natEip.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        const sharedDefaultRoute = new ec2.CfnRoute(this, "shared-default-route", {
+            routeTableId: sharedVpcRouteTable.attrRouteTableId,
+            destinationCidrBlock: "0.0.0.0/0",
+            instanceId: natEc2Instance.instanceId
+        });
+        sharedDefaultRoute.applyRemovalPolicy(RemovalPolicy.DESTROY);
     }
 }
