@@ -1,8 +1,26 @@
 import {RemovalPolicy, Stack, StackProps} from 'aws-cdk-lib';
 import {Construct} from 'constructs';
 import * as ec2 from "aws-cdk-lib/aws-ec2";
-import {CfnVPCPeeringConnection} from "aws-cdk-lib/aws-ec2";
+import {CfnVPCPeeringConnection, FlowLogDestination, FlowLogTrafficType} from "aws-cdk-lib/aws-ec2";
+import * as logs from "aws-cdk-lib/aws-logs";
+import * as iam from "aws-cdk-lib/aws-iam";
+import {RetentionDays} from "aws-cdk-lib/aws-logs";
+import {PolicyStatement, ServicePrincipal} from "aws-cdk-lib/aws-iam";
 
+/**
+ * Stack contains resources related to Pluralsight VPC deep dive course.
+ *
+ * Some resources which look at setting up a transit VPC and CloudHub are
+ * contained with the TransitVpcConstruct class. These resources rely on on-prem services
+ * which don't actually exist and also include some manual steps which cannot be done through code.
+ * The infra setup for these resources is contained in this class for sake of example but
+ * the construct itself is not being used as deploying it would cause errors and the whole setup would
+ * not work as expected.
+ *
+ * The Pluralsight course also has a module on setting up ipv6 connectivity in VPCs but this is not
+ * supported in CDK so not included here.
+ * See open Github issue: https://github.com/aws/aws-cdk/issues/894
+ */
 export class VpcPluralsightStack extends Stack {
     constructor(scope: Construct, id: string, props?: StackProps) {
         super(scope, id, props);
@@ -324,5 +342,45 @@ export class VpcPluralsightStack extends Stack {
             instanceId: natEc2Instance.instanceId
         });
         sharedDefaultRoute.applyRemovalPolicy(RemovalPolicy.DESTROY);
+
+        // Use of TransitVpcConstruct would go here. See class for comments on why it is unused.
+
+        // VPC flow logs allow monitoring of VPC traffic data
+        // Flow logs can be saved to either cloudwatch or S3
+        // Pluralsight course covers both, skipping S3 here because it is near identical to below code
+        // and we log using cloudwatch
+        const logsIamRole = new iam.Role(this, "LogsIMARole", {
+            roleName: "IAM-logs-role",
+            assumedBy: new ServicePrincipal("vpc-flow-logs.amazonaws.com")
+        });
+        logsIamRole.addToPolicy(new PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            resources: ["*"],
+            actions: ["logs:*"]
+        }))
+
+        const publicVpcAcceptFlowLogGroup = new logs.LogGroup(this, "public-vpc-accept-log-group", {
+            logGroupName: "PublicVPCAcceptLogGroup",
+            retention: RetentionDays.ONE_DAY,
+            removalPolicy: RemovalPolicy.DESTROY
+        });
+
+        // Log all accepted traffic
+        publicVpc.addFlowLog("public-vpc-accept-flow-log", {
+            destination: FlowLogDestination.toCloudWatchLogs(publicVpcAcceptFlowLogGroup, logsIamRole),
+            trafficType: FlowLogTrafficType.ACCEPT
+        });
+
+        const publicVpcRejectFlowLogGroup = new logs.LogGroup(this, "public-vpc-reject-log-group", {
+            logGroupName: "PublicVPCRejectLogGroup",
+            retention: RetentionDays.ONE_DAY,
+            removalPolicy: RemovalPolicy.DESTROY
+        });
+
+        // Log all rejected traffic
+        publicVpc.addFlowLog("public-vpc-reject-flow-log", {
+            destination: FlowLogDestination.toCloudWatchLogs(publicVpcRejectFlowLogGroup, logsIamRole),
+            trafficType: FlowLogTrafficType.REJECT
+        });
     }
 }
